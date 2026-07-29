@@ -438,6 +438,20 @@ class WorkflowAppGenerateTaskPipeline(GraphRuntimeStateSupport):
         _ = trace_manager
         self._ensure_workflow_initialized()
         validated_state = self._ensure_graph_runtime_initialized()
+
+        # Emit a final message chunk with the complete outputs.answer so streaming clients
+        # receive the full answer even when the answer node itself does not produce
+        # NodeRunStreamChunkEvent (e.g., pure variable assignment nodes).
+        outputs = event.outputs
+        if outputs and "answer" in outputs:
+            answer_text = outputs["answer"]
+            if isinstance(answer_text, str) and answer_text:
+                yield self._text_chunk_to_stream_response(
+                    text=answer_text,
+                    from_variable_selector=["answer"],
+                    node_id="answer",
+                )
+
         workflow_finish_resp = self._workflow_response_converter.workflow_finish_to_stream_response(
             task_id=self._application_generate_entity.task_id,
             workflow_id=self._workflow.id,

@@ -685,6 +685,27 @@ class AdvancedChatAppGenerateTaskPipeline(GraphRuntimeStateSupport):
         _ = trace_manager
         self._ensure_workflow_initialized()
         validated_state = self._ensure_graph_runtime_initialized()
+
+        outputs = event.outputs
+        logger.warning(
+            "[FIX] workflow succeeded, outputs=%r, has_answer=%s",
+            outputs,
+            "answer" in outputs if outputs else False,
+        )
+        if outputs and "answer" in outputs:
+            answer_text = outputs["answer"]
+            logger.warning(
+                "[FIX] answer_text=%r, task_state.answer=%r",
+                answer_text,
+                self._task_state.answer,
+            )
+            if isinstance(answer_text, str) and answer_text and answer_text != self._task_state.answer:
+                logger.warning("[FIX] emitting message_replace")
+                self._task_state.answer = answer_text
+                yield self._message_cycle_manager.message_replace_to_stream_response(
+                    answer=answer_text,
+                )
+
         workflow_finish_resp = self._workflow_response_converter.workflow_finish_to_stream_response(
             task_id=self._application_generate_entity.task_id,
             workflow_id=self._workflow_id,
@@ -708,6 +729,16 @@ class AdvancedChatAppGenerateTaskPipeline(GraphRuntimeStateSupport):
         _ = trace_manager
         self._ensure_workflow_initialized()
         validated_state = self._ensure_graph_runtime_initialized()
+
+        outputs = event.outputs
+        if outputs and "answer" in outputs:
+            answer_text = outputs["answer"]
+            if isinstance(answer_text, str) and answer_text and answer_text != self._task_state.answer:
+                self._task_state.answer = answer_text
+                yield self._message_cycle_manager.message_replace_to_stream_response(
+                    answer=answer_text,
+                )
+
         workflow_finish_resp = self._workflow_response_converter.workflow_finish_to_stream_response(
             task_id=self._application_generate_entity.task_id,
             workflow_id=self._workflow_id,
