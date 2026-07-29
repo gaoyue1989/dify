@@ -47,29 +47,31 @@ class AppGenerateService:
         - pubsub/sharded transport: start on first subscribe, with a short fallback timer so the task
           still runs if the client never connects.
         """
-        # Capture the OTel context from the caller (the Flask request greenlet)
-        # so that CeleryInstrumentor can propagate traceparent into the task message.
-        # Without this, the threading.Timer callback (or the on_subscribe callback)
-        # runs in a different greenlet where contextvars are not inherited,
-        # causing the apply_async span to become an orphan root.
-        otel_ctx = context_api.get_current()
-
         started = False
         lock = threading.Lock()
 
+        otel_context = None
+        if dify_config.ENABLE_OTEL:
+            otel_context = context_api.get_current()
+
         def _try_start() -> bool:
             nonlocal started
+
+            token = None
+
             with lock:
                 if started:
                     return True
-                token = context_api.attach(otel_ctx)
                 try:
+                    if otel_context:
+                        token = context_api.attach(otel_context)
                     start_task()
                 except Exception:
                     logger.exception("Failed to enqueue streaming task")
                     return False
                 finally:
-                    context_api.detach(token)
+                    if token:
+                        context_api.detach(token)
                 started = True
                 return True
 
@@ -158,7 +160,9 @@ class AppGenerateService:
             elif app_model.mode == AppMode.ADVANCED_CHAT:
                 workflow_id = args.get("workflow_id")
                 workflow = cls._get_workflow(app_model, invoke_from, workflow_id)
+
                 if streaming:
+                    # Streaming mode: subscribe to SSE and enqueue the execution on first subscriber
                     with rate_limit_context(rate_limit, request_id):
                         payload = AppExecutionParams.new(
                             app_model=app_model,
@@ -186,22 +190,24 @@ class AppGenerateService:
                         ),
                         request_id=request_id,
                     )
-
-                generator = AdvancedChatAppGenerator()
-                return rate_limit.generate(
-                    generator.convert_to_event_stream(
-                        generator.generate(
-                            app_model=app_model,
-                            workflow=workflow,
-                            user=user,
-                            args=args,
-                            invoke_from=invoke_from,
-                            workflow_run_id=str(uuid.uuid4()),
-                            streaming=False,
+                else:
+                    # Blocking mode: run synchronously and return JSON instead of SSE
+                    # Keep behaviour consistent with WORKFLOW blocking branch.
+                    advanced_generator = AdvancedChatAppGenerator()
+                    return rate_limit.generate(
+                        advanced_generator.convert_to_event_stream(
+                            advanced_generator.generate(
+                                app_model=app_model,
+                                workflow=workflow,
+                                user=user,
+                                args=args,
+                                invoke_from=invoke_from,
+                                workflow_run_id=str(uuid.uuid4()),
+                                streaming=False,
+                            )
                         ),
-                    ),
-                    request_id=request_id,
-                )
+                        request_id=request_id,
+                    )
             elif app_model.mode == AppMode.WORKFLOW:
                 workflow_id = args.get("workflow_id")
                 workflow = cls._get_workflow(app_model, invoke_from, workflow_id)
