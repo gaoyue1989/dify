@@ -153,6 +153,9 @@ class ProviderManager:
         # Get All provider model credentials
         provider_name_to_provider_model_credentials_dict = self._get_all_provider_model_credentials(tenant_id)
 
+        # Get All provider credentials
+        provider_name_to_provider_credentials_dict = self._get_all_provider_credentials(tenant_id)
+
         provider_configurations = ProviderConfigurations(tenant_id=tenant_id)
 
         # Construct ProviderConfiguration objects for each provider
@@ -182,10 +185,21 @@ class ProviderManager:
                 provider_model_credentials.extend(
                     provider_name_to_provider_model_credentials_dict.get(provider_id_entity.provider_name, [])
                 )
+            provider_credentials = provider_name_to_provider_credentials_dict.get(provider_entity.provider, [])
+            provider_id_entity = ModelProviderID(provider_name)
+            if provider_id_entity.is_langgenius():
+                provider_credentials.extend(
+                    provider_name_to_provider_credentials_dict.get(provider_id_entity.provider_name, [])
+                )
 
             # Convert to custom configuration
             custom_configuration = self._to_custom_configuration(
-                tenant_id, provider_entity, provider_records, provider_model_records, provider_model_credentials
+                tenant_id,
+                provider_entity,
+                provider_records,
+                provider_model_records,
+                provider_model_credentials,
+                provider_credentials,
             )
 
             # Convert to system configuration
@@ -483,6 +497,24 @@ class ProviderManager:
         return provider_name_to_provider_model_credentials_dict
 
     @staticmethod
+    def _get_all_provider_credentials(tenant_id: str) -> dict[str, list[ProviderCredential]]:
+        """
+        Get All provider credentials of the workspace.
+
+        :param tenant_id: workspace id
+        :return:
+        """
+        provider_name_to_provider_credentials_dict = defaultdict(list)
+        with Session(db.engine, expire_on_commit=False) as session:
+            stmt = select(ProviderCredential).where(ProviderCredential.tenant_id == tenant_id)
+            provider_credentials = session.scalars(stmt)
+            for provider_credential in provider_credentials:
+                provider_name_to_provider_credentials_dict[provider_credential.provider_name].append(
+                    provider_credential
+                )
+        return provider_name_to_provider_credentials_dict
+
+    @staticmethod
     def _get_all_provider_load_balancing_configs(tenant_id: str) -> dict[str, list[LoadBalancingModelConfig]]:
         """
         Get All provider load balancing configs of the workspace.
@@ -663,6 +695,7 @@ class ProviderManager:
         provider_records: list[Provider],
         provider_model_records: list[ProviderModel],
         provider_model_credentials: list[ProviderModelCredential],
+        provider_credentials: list[ProviderCredential],
     ) -> CustomConfiguration:
         """
         Convert to custom configuration.
@@ -671,11 +704,13 @@ class ProviderManager:
         :param provider_entity: provider entity
         :param provider_records: provider records
         :param provider_model_records: provider model records
+        :param provider_model_credentials: provider model credentials
+        :param provider_credentials: provider credentials
         :return:
         """
         # Get custom provider configuration
         custom_provider_configuration = self._get_custom_provider_configuration(
-            tenant_id, provider_entity, provider_records
+            tenant_id, provider_entity, provider_records, provider_credentials
         )
 
         # Get custom models which have not been added to the model list yet
@@ -697,7 +732,11 @@ class ProviderManager:
         )
 
     def _get_custom_provider_configuration(
-        self, tenant_id: str, provider_entity: ProviderEntity, provider_records: list[Provider]
+        self,
+        tenant_id: str,
+        provider_entity: ProviderEntity,
+        provider_records: list[Provider],
+        provider_credentials: list[ProviderCredential],
     ) -> CustomProviderConfiguration | None:
         """Get custom provider configuration."""
         # Find custom provider record (non-system)
@@ -715,19 +754,30 @@ class ProviderManager:
             else []
         )
 
+        # Build credential_id -> ProviderCredential index to avoid N+1 queries
+        # when resolving custom_provider_record.encrypted_config via lazy-loaded
+        # Provider.credential (which would issue a SELECT per record).
+        credential_by_id: dict[str, ProviderCredential] = {
+            credential.id: credential for credential in provider_credentials
+        }
+        matched_credential = (
+            credential_by_id.get(custom_provider_record.credential_id) if custom_provider_record.credential_id else None
+        )
+        encrypted_config = matched_credential.encrypted_config if matched_credential else None
+
         # Get and decrypt provider credentials
-        provider_credentials = self._get_and_decrypt_credentials(
+        decrypted_provider_credentials = self._get_and_decrypt_credentials(
             tenant_id=tenant_id,
             record_id=custom_provider_record.id,
-            encrypted_config=custom_provider_record.encrypted_config,
+            encrypted_config=encrypted_config,
             secret_variables=provider_credential_secret_variables,
             cache_type=ProviderCredentialsCacheType.PROVIDER,
             is_provider=True,
         )
 
         return CustomProviderConfiguration(
-            credentials=provider_credentials,
-            current_credential_name=custom_provider_record.credential_name,
+            credentials=decrypted_provider_credentials,
+            current_credential_name=matched_credential.credential_name if matched_credential else None,
             current_credential_id=custom_provider_record.credential_id,
             available_credentials=self.get_provider_available_credentials(
                 tenant_id, custom_provider_record.provider_name
@@ -785,6 +835,13 @@ class ProviderManager:
         for credential in all_model_credentials:
             credentials_map[(credential.model_name, credential.model_type)].append(credential)
 
+        # Build credential_id -> ProviderModelCredential index to avoid N+1 queries
+        # when resolving provider_model_record.encrypted_config via lazy-loaded
+        # ProviderModel.credential (which would issue a SELECT per record).
+        credential_by_id: dict[str, ProviderModelCredential] = {
+            credential.id: credential for credential in all_model_credentials
+        }
+
         custom_model_configurations = []
 
         # Process existing model records
@@ -797,11 +854,18 @@ class ProviderManager:
                 )
             ]
 
+            matched_credential = (
+                credential_by_id.get(provider_model_record.credential_id)
+                if provider_model_record.credential_id
+                else None
+            )
+            encrypted_config = matched_credential.encrypted_config if matched_credential else None
+
             # Get and decrypt model credentials
             provider_model_credentials = self._get_and_decrypt_credentials(
                 tenant_id=tenant_id,
                 record_id=provider_model_record.id,
-                encrypted_config=provider_model_record.encrypted_config,
+                encrypted_config=encrypted_config,
                 secret_variables=model_credential_secret_variables,
                 cache_type=ProviderCredentialsCacheType.MODEL,
                 is_provider=False,
@@ -813,7 +877,7 @@ class ProviderManager:
                     model_type=ModelType.value_of(provider_model_record.model_type),
                     credentials=provider_model_credentials,
                     current_credential_id=provider_model_record.credential_id,
-                    current_credential_name=provider_model_record.credential_name,
+                    current_credential_name=matched_credential.credential_name if matched_credential else None,
                     available_model_credentials=available_model_credentials,
                 )
             )
